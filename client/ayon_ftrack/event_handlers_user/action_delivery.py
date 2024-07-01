@@ -330,6 +330,11 @@ class Delivery(LocalAction):
 
             anatomy_data = copy.deepcopy(repre["context"])
 
+            # update custom attributes
+            anatomy_data = self.fill_custom_attributes(
+                session, anatomy_data
+            )
+
             # update anatomy root
             anatomy_data["root"] = anatomy.roots
 
@@ -772,6 +777,42 @@ class Delivery(LocalAction):
                 filtered_versions.append(version_entity)
 
         return filtered_versions
+
+    def fill_custom_attributes(self, session, anatomy_data):
+        entity = None
+        custom_attr = None
+        list_custom_attr = [
+            "deliveryName",
+            "deliveryNameCustom",
+            "cameraName"
+        ]
+
+        folder = anatomy_data["asset"]
+        project_name = anatomy_data["project"]["name"]
+
+        query = (
+            'TypedContext where name is "{}"'
+            ' and project.full_name is "{}"'
+        ).format(folder, project_name)
+
+        try:
+            entity = session.query(query).first()
+            custom_attr = entity.get("custom_attributes")
+        except:
+            self.log.warning("Entities not Found")
+
+        if custom_attr:
+            for item in list_custom_attr:
+                value = custom_attr.get(item)
+                self.log.debug(value)
+                if not value:
+                    continue
+
+                anatomy_data.update({
+                    item: value.strip()
+                })
+
+        return anatomy_data
 
 
 def register(session):
