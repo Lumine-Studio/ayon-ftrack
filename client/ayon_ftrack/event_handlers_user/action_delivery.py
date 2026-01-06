@@ -2,6 +2,7 @@ import os
 import copy
 import json
 import collections
+import shutil
 
 from ayon_api import (
     get_attributes_for_type,
@@ -20,6 +21,7 @@ from ayon_ftrack.common import (
 )
 from ayon_ftrack.lib import get_ftrack_icon_url
 
+from ayon_core.lib import TemplateUnsolved
 from ayon_core.lib.dateutils import get_datetime_data
 from ayon_core.pipeline import Anatomy
 from ayon_core.pipeline.load import get_representation_path_with_anatomy
@@ -197,6 +199,13 @@ class Delivery(LocalAction):
             "value": first
         })
 
+        items.append({
+            "type": "boolean",
+            "name": "__zip_after_delivery__",
+            "label": "Create ZIP",
+            "value": False
+        })
+
         return {
             "items": items,
             "title": title
@@ -289,6 +298,7 @@ class Delivery(LocalAction):
         location_path = values.pop("__location_path__")
         anatomy_name = values.pop("__delivery_template__")
         project_name = values.pop("__project_name__")
+        zip_after_delivery = values.pop("__zip_after_delivery__", False)
 
         repre_names = set()
         for key, value in values.items():
@@ -319,6 +329,7 @@ class Delivery(LocalAction):
         anatomy = Anatomy(project_name)
 
         format_dict = get_format_dict(anatomy, location_path)
+        delivered_folders = set()
 
         datetime_data = get_datetime_data()
         for repre in repres_to_deliver:
@@ -372,6 +383,15 @@ class Delivery(LocalAction):
 
             # Get source repre path
             frame = repre["context"].get("frame")
+            target_folder = None
+            if zip_after_delivery:
+                target_folder = self._get_delivery_folder_path(
+                    anatomy,
+                    anatomy_name,
+                    anatomy_data,
+                    format_dict,
+                    is_sequence=bool(frame)
+                )
 
             if frame:
                 repre["context"]["frame"] = len(str(frame)) * "#"
@@ -394,7 +414,24 @@ class Delivery(LocalAction):
             else:
                 deliver_sequence(*args)
 
-        return self.report(report_items)
+            if zip_after_delivery and target_folder:
+                delivered_folders.add(target_folder)
+
+        zip_count = 0
+        if zip_after_delivery and delivered_folders:
+            zip_count = self._zip_delivered_folders(
+                delivered_folders,
+                report_items
+            )
+
+        report = self.report(report_items)
+        if report["success"] and zip_count:
+            suffix = "folder" if zip_count == 1 else "folders"
+            report["message"] = (
+                f"{report['message']} (Zipped {zip_count} {suffix})"
+            )
+
+        return report
 
     def report(self, report_items):
         """Returns dict with final status of delivery (success, fail etc.).
@@ -777,6 +814,90 @@ class Delivery(LocalAction):
                 filtered_versions.append(version_entity)
 
         return filtered_versions
+
+    def _get_delivery_folder_path(
+        self,
+        anatomy,
+        template_name,
+        anatomy_data,
+        format_dict,
+        is_sequence=False
+    ):
+        data = copy.deepcopy(anatomy_data)
+        if format_dict:
+            data["root"] = format_dict["root"]
+
+        template_obj = anatomy.get_template_item(
+            "delivery", template_name, "path", default=None
+        )
+        if template_obj is None:
+            return None
+
+        if is_sequence:
+            data["frame"] = "@####@"
+
+        try:
+            delivery_path = template_obj.format_strict(data)
+        except TemplateUnsolved:
+            self.log.warning(
+                "Failed to resolve delivery template for zip.",
+                exc_info=True
+            )
+            return None
+
+        delivery_path = str(delivery_path)
+        if not is_sequence:
+            delivery_path = delivery_path.replace("..", ".")
+        delivery_path = os.path.normpath(delivery_path.replace("\\", "/"))
+        delivery_path = delivery_path.rstrip()
+        return os.path.dirname(delivery_path)
+
+    def _zip_delivered_folders(self, folder_paths, report_items):
+        zipped_count = 0
+        for folder_path in sorted(folder_paths):
+            if not folder_path:
+                continue
+            normalized = os.path.normpath(folder_path)
+            if not os.path.isdir(normalized):
+                report_items["ZIP failed"].append(
+                    "Folder not found: {}".format(normalized)
+                )
+                continue
+
+            parent_dir = os.path.dirname(normalized)
+            folder_name = os.path.basename(normalized)
+            if not folder_name:
+                report_items["ZIP failed"].append(
+                    "Invalid folder name: {}".format(normalized)
+                )
+                continue
+
+            base_name = os.path.join(parent_dir, folder_name)
+            zip_path = "{}".format(base_name + ".zip")
+            try:
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+                shutil.make_archive(
+                    base_name=base_name,
+                    format="zip",
+                    root_dir=parent_dir or normalized,
+                    base_dir=folder_name if parent_dir else "."
+                )
+                zipped_count += 1
+                self.log.info(
+                    "Created ZIP archive %s for %s",
+                    zip_path,
+                    normalized
+                )
+            except Exception as exc:
+                self.log.warning(
+                    "Failed to create ZIP for %s", normalized, exc_info=True
+                )
+                report_items["ZIP failed"].append(
+                    "{}: {}".format(normalized, exc)
+                )
+
+        return zipped_count
 
     def fill_custom_attributes(self, session, anatomy_data):
         entity = None
