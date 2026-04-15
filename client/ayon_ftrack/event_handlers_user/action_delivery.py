@@ -839,12 +839,6 @@ class Delivery(LocalAction):
         return filtered_versions
 
     def fill_custom_attributes(self, session, template_data):
-        list_custom_attr = [
-            "deliveryName",
-            "deliveryNameCustom",
-            "cameraName"
-        ]
-
         folder_data = template_data.get("folder")
         if isinstance(folder_data, dict):
             folder_name = folder_data.get("name")
@@ -878,14 +872,21 @@ class Delivery(LocalAction):
             self.log.warning("Entities not Found", exc_info=True)
 
         if custom_attr:
-            for item in list_custom_attr:
-                value = custom_attr.get(item)
-                self.log.debug(
-                    "Custom attribute %s = %s", item, value
-                )
-                if not value:
+            for key in custom_attr.keys():
+                if key in template_data:
+                    self.log.debug(
+                        "Skipping custom attribute '%s'"
+                        " - already exists in template data",
+                        key
+                    )
                     continue
-                template_data[item] = value.strip()
+                value = custom_attr.get(key)
+                if not value or not isinstance(value, str):
+                    continue
+                self.log.debug(
+                    "Custom attribute %s = %s", key, value
+                )
+                template_data[key] = value.strip()
 
         return template_data
 
