@@ -47,6 +47,13 @@ class FtrackAddon(
             os.path.join(current_dir, "event_handlers_user")
         ]
 
+        acacia_root = os.getenv("ACACIA")
+        if acacia_root:
+            user_event_handlers_paths.append(
+                os.path.join(
+                    acacia_root, "modules", "ftrack", "event_handlers_user"
+                )
+            )
         # Prepare attribute
         self.user_event_handlers_paths = user_event_handlers_paths
         self._tray_wrapper = None
