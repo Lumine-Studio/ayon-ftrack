@@ -1,6 +1,8 @@
 import os
+import copy
 import json
 import collections
+import shutil
 
 from ayon_api import (
     get_attributes_for_type,
@@ -19,7 +21,7 @@ from ayon_ftrack.common import (
 )
 from ayon_ftrack.lib import get_ftrack_icon_url
 
-from ayon_core.lib import collect_frames
+from ayon_core.lib import collect_frames, TemplateUnsolved
 from ayon_core.lib.dateutils import get_datetime_data
 from ayon_core.pipeline import Anatomy
 from ayon_core.pipeline.load import get_representation_path_with_anatomy
@@ -198,6 +200,13 @@ class Delivery(LocalAction):
             "value": first,
         })
 
+        items.append({
+            "type": "boolean",
+            "name": "__zip_after_delivery__",
+            "label": "Create ZIP",
+            "value": False
+        })
+
         items.append(item_splitter)
 
         items.append({
@@ -311,6 +320,7 @@ class Delivery(LocalAction):
         template_name = values.pop("__delivery_template__")
         project_name = values.pop("__project_name__")
         session_name = values.pop("__session_name__")
+        zip_after_delivery = values.pop("__zip_after_delivery__", False)
 
         repre_names = set()
         for key, value in values.items():
@@ -347,6 +357,7 @@ class Delivery(LocalAction):
         anatomy = Anatomy(project_name)
 
         format_dict = get_format_dict(anatomy, location_path)
+        delivered_folders = set()
 
         datetime_data = get_datetime_data()
         repres_counter = len(repres_to_deliver)
@@ -360,6 +371,9 @@ class Delivery(LocalAction):
                 f" '{repre_id}'"
             )
             template_data = template_data_by_repre_id[repre_id]
+            template_data = self.fill_custom_attributes(
+                session, template_data
+            )
             if session_name:
                 template_data["ftrack"] = {
                     "session_name": session_name,
@@ -391,6 +405,20 @@ class Delivery(LocalAction):
                 src_path = anatomy.fill_root(repre_file["path"])
                 src_paths.append(src_path)
             sources_and_frames = collect_frames(src_paths)
+
+            target_folder = None
+            if zip_after_delivery:
+                has_frames = any(
+                    f is not None for f in sources_and_frames.values()
+                )
+                target_folder = self._get_delivery_folder_path(
+                    anatomy,
+                    template_name,
+                    template_data,
+                    format_dict,
+                    is_sequence=has_frames
+                )
+
             for src_path, frame in sources_and_frames.items():
                 args[0] = src_path
                 if frame is not None:
@@ -408,7 +436,25 @@ class Delivery(LocalAction):
                         template_data["frame"] = frame
                 new_report_items, uploaded = deliver_single_file(*args)
                 report_items.update(new_report_items)
-        return self.report(report_items)
+
+            if zip_after_delivery and target_folder:
+                delivered_folders.add(target_folder)
+
+        zip_count = 0
+        if zip_after_delivery and delivered_folders:
+            zip_count = self._zip_delivered_folders(
+                delivered_folders,
+                report_items
+            )
+
+        report = self.report(report_items)
+        if report["success"] and zip_count:
+            suffix = "folder" if zip_count == 1 else "folders"
+            report["message"] = (
+                f"{report['message']} (Zipped {zip_count} {suffix})"
+            )
+
+        return report
 
     def report(self, report_items):
         """Returns dict with final status of delivery (success, fail etc.).
@@ -791,3 +837,139 @@ class Delivery(LocalAction):
                 filtered_versions.append(version_entity)
 
         return filtered_versions
+
+    def fill_custom_attributes(self, session, template_data):
+        folder_data = template_data.get("folder")
+        if isinstance(folder_data, dict):
+            folder_name = folder_data.get("name")
+        else:
+            folder_name = template_data.get("asset")
+
+        project_data = template_data.get("project")
+        if isinstance(project_data, dict):
+            project_name = project_data.get("name")
+        else:
+            project_name = None
+
+        if not folder_name or not project_name:
+            self.log.debug(
+                "Cannot fill custom attributes: folder=%s, project=%s",
+                folder_name, project_name
+            )
+            return template_data
+
+        query = (
+            'TypedContext where name is "{}"'
+            ' and project.full_name is "{}"'
+        ).format(folder_name, project_name)
+
+        custom_attr = None
+        try:
+            entity = session.query(query).first()
+            if entity:
+                custom_attr = entity.get("custom_attributes")
+        except Exception:
+            self.log.warning("Entities not Found", exc_info=True)
+
+        if custom_attr:
+            for key in custom_attr.keys():
+                if key in template_data:
+                    self.log.debug(
+                        "Skipping custom attribute '%s'"
+                        " - already exists in template data",
+                        key
+                    )
+                    continue
+                value = custom_attr.get(key)
+                if not value or not isinstance(value, str):
+                    continue
+                self.log.debug(
+                    "Custom attribute %s = %s", key, value
+                )
+                template_data[key] = value.strip()
+
+        return template_data
+
+    def _get_delivery_folder_path(
+        self,
+        anatomy,
+        template_name,
+        anatomy_data,
+        format_dict,
+        is_sequence=False
+    ):
+        data = copy.deepcopy(anatomy_data)
+        if format_dict:
+            data["root"] = format_dict["root"]
+
+        template_obj = anatomy.get_template_item(
+            "delivery", template_name, "path", default=None
+        )
+        if template_obj is None:
+            return None
+
+        if is_sequence:
+            data["frame"] = "@####@"
+
+        try:
+            delivery_path = template_obj.format_strict(data)
+        except TemplateUnsolved:
+            self.log.warning(
+                "Failed to resolve delivery template for zip.",
+                exc_info=True
+            )
+            return None
+
+        delivery_path = str(delivery_path)
+        if not is_sequence:
+            delivery_path = delivery_path.replace("..", ".")
+        delivery_path = os.path.normpath(delivery_path.replace("\\", "/"))
+        delivery_path = delivery_path.rstrip()
+        return os.path.dirname(delivery_path)
+
+    def _zip_delivered_folders(self, folder_paths, report_items):
+        zipped_count = 0
+        for folder_path in sorted(folder_paths):
+            if not folder_path:
+                continue
+            normalized = os.path.normpath(folder_path)
+            if not os.path.isdir(normalized):
+                report_items["ZIP failed"].append(
+                    "Folder not found: {}".format(normalized)
+                )
+                continue
+
+            parent_dir = os.path.dirname(normalized)
+            folder_name = os.path.basename(normalized)
+            if not folder_name:
+                report_items["ZIP failed"].append(
+                    "Invalid folder name: {}".format(normalized)
+                )
+                continue
+
+            base_name = os.path.join(parent_dir, folder_name)
+            zip_path = "{}".format(base_name + ".zip")
+            try:
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+                shutil.make_archive(
+                    base_name=base_name,
+                    format="zip",
+                    root_dir=parent_dir or normalized,
+                    base_dir=folder_name if parent_dir else "."
+                )
+                zipped_count += 1
+                self.log.info(
+                    "Created ZIP archive %s for %s",
+                    zip_path,
+                    normalized
+                )
+            except Exception as exc:
+                self.log.warning(
+                    "Failed to create ZIP for %s", normalized, exc_info=True
+                )
+                report_items["ZIP failed"].append(
+                    "{}: {}".format(normalized, exc)
+                )
+
+        return zipped_count
