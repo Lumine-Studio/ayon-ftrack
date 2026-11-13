@@ -40,6 +40,10 @@ FileMapping = Tuple[Union[str, io.BytesIO], str]
 
 ADDON_NAME: str = package.name
 ADDON_VERSION: str = package.version
+# Images come from ynput's registry, which only has upstream tags.
+SERVICE_IMAGE_TAG: str = getattr(
+    package, "service_image_tag", package.version
+)
 ADDON_CLIENT_DIR: Union[str, None] = getattr(package, "client_dir", None)
 
 CURRENT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
@@ -280,7 +284,7 @@ def update_docker_version(logger):
                 image_r = image_regex.search(line)
                 if image_r:
                     base = image_r.group("base")
-                    new_line = f"{base}{ADDON_VERSION}"
+                    new_line = f"{base}{SERVICE_IMAGE_TAG}"
                     image_changed = new_line != line
                     line = new_line
 
